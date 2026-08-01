@@ -1,0 +1,53 @@
+services:
+  api:
+    environment:
+      ALLOW_PRIVATE_WEBHOOKS: "true"
+      OUTBOX_POLL_INTERVAL_SECONDS: "0.05"
+      PAYMENT_MIN_DELAY_SECONDS: "0.05"
+      PAYMENT_MAX_DELAY_SECONDS: "0.10"
+      RETRY_BASE_DELAY_SECONDS: "1"
+      WEBHOOK_BUSY_RETRY_DELAY_SECONDS: "0.10"
+      REQUIRE_HTTPS_WEBHOOKS: "false"
+
+  consumer:
+    environment:
+      ALLOW_PRIVATE_WEBHOOKS: "true"
+      PAYMENT_MIN_DELAY_SECONDS: "0.05"
+      PAYMENT_MAX_DELAY_SECONDS: "0.10"
+      RETRY_BASE_DELAY_SECONDS: "1"
+      WEBHOOK_BUSY_RETRY_DELAY_SECONDS: "0.10"
+      REQUIRE_HTTPS_WEBHOOKS: "false"
+    depends_on:
+      webhook-sink:
+        condition: service_healthy
+
+  webhook-sink:
+    build:
+      context: .
+      target: runtime
+    image: async-payment-service:local
+    command:
+      - uvicorn
+      - payment_service.testing.webhook_sink:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    init: true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:18080:8080"
+
+  postgres:
+    ports:
+      - "127.0.0.1:15432:5432"
