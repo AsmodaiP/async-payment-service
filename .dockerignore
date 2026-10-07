@@ -1,4 +1,7 @@
 .git
+.env
+.env.*
+graphify-out
 .github
 .mypy_cache
 .pytest_cache

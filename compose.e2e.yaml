@@ -1,21 +1,29 @@
 services:
   api:
+    ports: !override
+      - "127.0.0.1::8000"
     environment:
+      ENVIRONMENT: "test"
       ALLOW_PRIVATE_WEBHOOKS: "true"
       OUTBOX_POLL_INTERVAL_SECONDS: "0.05"
       PAYMENT_MIN_DELAY_SECONDS: "0.05"
       PAYMENT_MAX_DELAY_SECONDS: "0.10"
       RETRY_BASE_DELAY_SECONDS: "1"
       WEBHOOK_BUSY_RETRY_DELAY_SECONDS: "0.10"
+      WEBHOOK_TIMEOUT_SECONDS: "3"
+      WEBHOOK_LEASE_SECONDS: "7"
       REQUIRE_HTTPS_WEBHOOKS: "false"
 
   consumer:
     environment:
+      ENVIRONMENT: "test"
       ALLOW_PRIVATE_WEBHOOKS: "true"
       PAYMENT_MIN_DELAY_SECONDS: "0.05"
       PAYMENT_MAX_DELAY_SECONDS: "0.10"
       RETRY_BASE_DELAY_SECONDS: "1"
       WEBHOOK_BUSY_RETRY_DELAY_SECONDS: "0.10"
+      WEBHOOK_TIMEOUT_SECONDS: "3"
+      WEBHOOK_LEASE_SECONDS: "7"
       REQUIRE_HTTPS_WEBHOOKS: "false"
     depends_on:
       webhook-sink:
@@ -46,8 +54,12 @@ services:
       timeout: 3s
       retries: 20
     ports:
-      - "127.0.0.1:18080:8080"
+      - "127.0.0.1::8080"
 
   postgres:
     ports:
-      - "127.0.0.1:15432:5432"
+      - "127.0.0.1::5432"
+
+  rabbitmq:
+    ports: !override
+      - "127.0.0.1::15672"

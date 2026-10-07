@@ -61,14 +61,21 @@ async def close_http_client() -> None:
     logger.info("consumer_stopped")
 
 
+def raw_event_body(message: RabbitMessage) -> bytes:
+    # Decode inside the handler: malformed JSON must reach its reject/DLQ path
+    # instead of failing in FastStream before manual acknowledgement is possible.
+    return bytes(message.body)
+
+
 @broker.subscriber(
     topology.new_payments_queue,
     topology.events_exchange,
     ack_policy=AckPolicy.MANUAL,
+    decoder=raw_event_body,
 )
-async def handle_payment(raw_event: dict[str, Any], message: RabbitMessage) -> None:
+async def handle_payment(raw_event: bytes, message: RabbitMessage) -> None:
     try:
-        event = PaymentCreatedEvent.model_validate(raw_event)
+        event = PaymentCreatedEvent.model_validate_json(raw_event)
     except ValidationError as exc:
         logger.warning(
             "poison_event_rejected",

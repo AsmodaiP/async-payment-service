@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
+from faststream.rabbit import ExchangeType, QueueType, RabbitBroker, RabbitExchange, RabbitQueue
+from faststream.rabbit.schemas.queue import QuorumQueueArgs
 
 from payment_service.config import Settings
 
@@ -11,6 +12,16 @@ RETRY_EXCHANGE_NAME = "payments.retry"
 DEAD_LETTER_EXCHANGE_NAME = "payments.dlx"
 NEW_PAYMENT_ROUTING_KEY = "payments.new"
 DEAD_PAYMENT_ROUTING_KEY = "payments.dead"
+
+# A classic queue dead-letters without publisher confirms. Quorum queues retain
+# source messages until the destination confirms the transfer, including TTL retry.
+RELIABLE_DEAD_LETTER_ARGUMENTS: QuorumQueueArgs = {
+    "x-dead-letter-strategy": "at-least-once",
+    "x-overflow": "reject-publish",
+    # Application attempts are bounded separately. Requeue while a crashed owner's
+    # lease expires must not use RabbitMQ's default poison-message budget of 20.
+    "x-delivery-limit": -1,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,9 +49,11 @@ def build_topology(settings: Settings) -> RabbitTopology:
 
     main_queue = RabbitQueue(
         "payments.new",
+        queue_type=QueueType.QUORUM,
         durable=True,
         routing_key=NEW_PAYMENT_ROUTING_KEY,
         arguments={
+            **RELIABLE_DEAD_LETTER_ARGUMENTS,
             "x-dead-letter-exchange": DEAD_LETTER_EXCHANGE_NAME,
             "x-dead-letter-routing-key": DEAD_PAYMENT_ROUTING_KEY,
         },
@@ -48,9 +61,11 @@ def build_topology(settings: Settings) -> RabbitTopology:
     retry_queues = tuple(
         RabbitQueue(
             f"payments.retry.{attempt}",
+            queue_type=QueueType.QUORUM,
             durable=True,
             routing_key=f"payments.retry.{attempt}",
             arguments={
+                **RELIABLE_DEAD_LETTER_ARGUMENTS,
                 "x-message-ttl": settings.retry_base_delay_seconds * (2 ** (attempt - 2)) * 1_000,
                 "x-dead-letter-exchange": EVENTS_EXCHANGE_NAME,
                 "x-dead-letter-routing-key": NEW_PAYMENT_ROUTING_KEY,
@@ -60,6 +75,7 @@ def build_topology(settings: Settings) -> RabbitTopology:
     )
     dead_queue = RabbitQueue(
         "payments.dlq",
+        queue_type=QueueType.QUORUM,
         durable=True,
         routing_key=DEAD_PAYMENT_ROUTING_KEY,
     )

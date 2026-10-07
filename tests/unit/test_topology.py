@@ -25,3 +25,14 @@ def test_retry_queue_maps_to_the_next_attempt() -> None:
 
     with pytest.raises(ValueError, match="no retry queue"):
         topology.retry_queue_for_attempt(1)
+
+
+def test_dead_letter_transfers_wait_for_confirmations() -> None:
+    topology = build_topology(Settings())
+    for queue in (topology.new_payments_queue, *topology.retry_queues):
+        assert queue.arguments["x-queue-type"] == "quorum"
+        assert queue.arguments["x-dead-letter-strategy"] == "at-least-once"
+        assert queue.arguments["x-overflow"] == "reject-publish"
+        # A busy webhook lease must not exhaust RabbitMQ's separate delivery limit.
+        assert queue.arguments["x-delivery-limit"] == -1
+    assert topology.dead_letter_queue.arguments["x-queue-type"] == "quorum"

@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from typing import Any
 
 import structlog
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, Request, status
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from payment_service.api.dependencies import require_api_key
 from payment_service.api.routes import router as payments_router
 from payment_service.api.schemas import HealthResponse
 from payment_service.config import Settings, get_settings
@@ -90,6 +93,10 @@ def create_app(
         title=app_settings.service_name,
         version="1.0.0",
         lifespan=lifespan,
+        dependencies=[Depends(require_api_key)],
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
     app.state.settings = app_settings
     app.state.db_engine = db_engine
@@ -148,6 +155,17 @@ def create_app(
         )
 
     app.include_router(payments_router)
+
+    # FastAPI's built-in docs routes bypass global dependencies. Register them
+    # explicitly so the assignment's API-key requirement also covers the schema.
+    @app.get("/openapi.json", include_in_schema=False)
+    async def openapi_schema() -> dict[str, Any]:
+        return app.openapi()
+
+    @app.get("/docs", include_in_schema=False)
+    async def swagger_docs() -> HTMLResponse:
+        return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{app.title} — API")
+
     return app
 
 

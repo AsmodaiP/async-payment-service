@@ -7,6 +7,8 @@ from uuid import UUID
 
 import pytest
 from faststream.rabbit import RabbitMessage
+from faststream.rabbit import TestRabbitBroker as RabbitTestBroker
+from faststream.rabbit.message import RabbitMessage as StreamRabbitMessage
 
 import payment_service.consumer.app as consumer_app
 from payment_service.messaging.events import PaymentCreatedEvent
@@ -34,6 +36,55 @@ def event() -> PaymentCreatedEvent:
         payment_id=UUID("00000000-0000-4000-8000-000000000001"),
         occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [b"{", b"[]", b"null", b"\xff", b'{"schema_version":99}'])
+async def test_poison_messages_are_rejected_after_raw_decoding(
+    payload: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejections: list[bool] = []
+
+    async def reject(_: Any, requeue: bool = False) -> None:
+        rejections.append(requeue)
+
+    monkeypatch.setattr(StreamRabbitMessage, "reject", reject)
+    async with RabbitTestBroker(consumer_app.broker) as test_broker:
+        await test_broker.publish(
+            payload,
+            exchange=consumer_app.topology.events_exchange,
+            routing_key="payments.new",
+            content_type="application/json",
+        )
+
+    assert rejections == [False]
+
+
+@pytest.mark.asyncio
+async def test_valid_raw_event_is_processed_before_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions: list[str] = []
+
+    async def process(parsed: PaymentCreatedEvent) -> None:
+        assert parsed == event()
+        actions.append("process")
+
+    async def ack(_: Any, multiple: bool = False) -> None:
+        actions.append("ack")
+
+    monkeypatch.setattr(consumer_app.processor, "process", process)
+    monkeypatch.setattr(StreamRabbitMessage, "ack", ack)
+    async with RabbitTestBroker(consumer_app.broker) as test_broker:
+        await test_broker.publish(
+            event().model_dump_json().encode(),
+            exchange=consumer_app.topology.events_exchange,
+            routing_key="payments.new",
+            content_type="application/json",
+        )
+
+    assert actions == ["process", "ack"]
 
 
 @pytest.mark.asyncio

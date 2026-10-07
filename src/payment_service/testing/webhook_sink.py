@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import defaultdict
 from typing import Any
 
@@ -48,8 +49,22 @@ async def succeed(request: Request) -> dict[str, bool]:
     return {"accepted": True}
 
 
+@app.post("/hooks/block-first")
+async def block_first(request: Request) -> dict[str, bool]:
+    event = await _record(request)
+    event_id = str(event["body"]["event_id"])
+    async with _lock:
+        _attempts[event_id] += 1
+        attempt = _attempts[event_id]
+    if attempt == 1:
+        # Give the e2e runner time to SIGKILL a consumer while it holds a DB lease.
+        await asyncio.sleep(5)
+    return {"accepted": True}
+
+
 async def _record(request: Request) -> dict[str, Any]:
     event = {
+        "received_at": time.monotonic(),
         "body": await request.json(),
         "attempt": request.headers.get("X-Webhook-Attempt"),
         "event_id": request.headers.get("X-Webhook-Event-Id"),

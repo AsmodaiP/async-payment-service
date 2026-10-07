@@ -108,7 +108,7 @@ async def test_create_payment_normalizes_key_and_marks_replay(
 
 @pytest.mark.asyncio
 async def test_openapi_documents_idempotent_replay_header(http_client: AsyncClient) -> None:
-    schema = (await http_client.get("/openapi.json")).json()
+    schema = (await http_client.get("/openapi.json", headers={"X-API-Key": API_KEY})).json()
     response = schema["paths"]["/api/v1/payments"]["post"]["responses"]["202"]
     assert "Idempotent-Replayed" in response["headers"]
 
@@ -190,9 +190,18 @@ async def test_get_payment_maps_not_found(
 
 
 @pytest.mark.asyncio
-async def test_health_endpoints_are_public(http_client: AsyncClient) -> None:
-    assert (await http_client.get("/health/live")).json() == {"status": "ok"}
-    assert (await http_client.get("/health/ready")).json() == {"status": "ready"}
+@pytest.mark.parametrize("path", ["/health/live", "/health/ready", "/docs", "/openapi.json"])
+async def test_all_http_endpoints_require_api_key(http_client: AsyncClient, path: str) -> None:
+    assert (await http_client.get(path)).status_code == 401
+    assert (await http_client.get(path, headers={"X-API-Key": "wrong-key"})).status_code == 401
+    assert (await http_client.get(path, headers={"X-API-Key": API_KEY})).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_authenticated_health_endpoints(http_client: AsyncClient) -> None:
+    headers = {"X-API-Key": API_KEY}
+    assert (await http_client.get("/health/live", headers=headers)).json() == {"status": "ok"}
+    assert (await http_client.get("/health/ready", headers=headers)).json() == {"status": "ready"}
 
 
 @pytest.mark.asyncio
@@ -202,7 +211,7 @@ async def test_not_ready_returns_503() -> None:
 
     app = create_app(Settings(api_key=API_KEY), not_ready, start_outbox_relay=False)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
-        response = await http.get("/health/ready")
+        response = await http.get("/health/ready", headers={"X-API-Key": API_KEY})
     assert response.status_code == 503
     assert response.json() == {"status": "not_ready"}
 

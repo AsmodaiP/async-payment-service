@@ -12,7 +12,7 @@
   идемпотентность на уровне PostgreSQL.
 - `Decimal`/`NUMERIC(18, 2)`, валюты `RUB`, `USD`, `EUR`, JSON metadata и статусы
   `pending`, `succeeded`, `failed`.
-- Transactional outbox, lease-based relay, durable RabbitMQ topology и подтверждение
+- Transactional outbox, lease-based relay, quorum RabbitMQ queues и подтверждение
   каждой публикации брокером.
 - Один асинхронный FastStream consumer, детерминированная эмуляция обработки 2–5 секунд
   с вероятностью успеха 90%.
@@ -42,6 +42,21 @@ Outbox-relay запущен в lifespan API, поэтому в базовом Co
 Несколько API-реплик могут безопасно публиковать параллельно: строки захватываются через
 короткий lease и `FOR UPDATE SKIP LOCKED`, а сетевой вызов не держит открытую DB-транзакцию.
 
+### Почему такая структура
+
+`api` отвечает за HTTP, валидацию и аутентификацию; `application` — за создание и поиск
+платежа; `db` — за состояние и ограничения; `messaging` — за Outbox и topology;
+`consumer` — за последовательность gateway → фиксация результата → webhook.
+Gateway и webhook передаются процессору через небольшие Protocol-интерфейсы, поэтому
+сценарии ошибок можно проверять без внешней сети.
+
+Платёж и уведомление имеют независимые состояния: недоступность webhook не переводит
+успешно обработанный платёж в `failed`. Счётчик webhook хранится в БД, а не только в
+заголовке сообщения: дубликаты не получают новый бюджет попыток. Денежная сумма хранится
+как `NUMERIC(18, 2)`; fingerprint строится из нормализованной суммы и JSON с сортировкой
+ключей. Уникальный индекс плюс `INSERT ... ON CONFLICT` разрешают конкурентные запросы
+без предварительного небезопасного «проверить, потом вставить».
+
 ### Гарантии доставки
 
 Система даёт **at-least-once**, а не exactly-once:
@@ -52,6 +67,17 @@ Outbox-relay запущен в lifespan API, поэтому в базовом Co
    повторно не запускает gateway для терминального платежа и не меняет его исход.
 4. Webhook также at-least-once: стабильный `X-Webhook-Event-Id` позволяет получателю
    дедуплицировать редкий повтор после HTTP `2xx`, если consumer упал до фиксации результата.
+
+| Момент сбоя | Восстановление |
+|---|---|
+| До commit создания | Откатываются и платёж, и событие; клиент повторяет запрос с тем же ключом |
+| После commit, RabbitMQ недоступен | API возвращает `202`, событие остаётся в Outbox до восстановления брокера |
+| После broker confirm, до `published_at` | Возможен повтор события; consumer проверяет сохранённое состояние |
+| После результата gateway, до записи в БД | Эмулятор при повторе выдаёт тот же результат для `payment_id` |
+| После записи результата, до webhook | Gateway повторно не вызывается; продолжается доставка webhook |
+| Во время webhook при жёстком завершении consumer | Unacked сообщение возвращается; новый обработчик ждёт истечения lease |
+| После HTTP `2xx`, до commit доставки | Возможен повтор webhook; получатель дедуплицирует `event_id` |
+| Три технические ошибки | Событие отправляется в DLQ; состояние самого платежа сохраняется |
 
 Бизнес-результат `failed` (10%) — штатный терминальный статус: он отправляется webhook и
 ACK-ается. В DLQ уходят технические/невалидные события или webhook, не принятый за три
@@ -71,9 +97,22 @@ ACK-ается. В DLQ уходят технические/невалидные 
 TTL рассчитывается как `RETRY_BASE_DELAY_SECONDS * 2^(attempt-2)`. Настройка topology
 должна быть одинаковой у API и consumer; Compose передаёт им общий набор переменных.
 
+Основная, retry- и dead-letter очереди — quorum. В основной и retry-очередях включены
+`x-dead-letter-strategy=at-least-once` и `x-overflow=reject-publish`: исходная очередь
+удерживает сообщение до подтверждения принимающей очереди. Обычный classic DLX этого
+не гарантирует. `x-delivery-limit=-1` отключает отдельный брокерный лимит redelivery;
+три прикладные попытки контролируются процессором. Так ожидание занятого lease после
+crash не исчерпывает лимит RabbitMQ раньше попытки отправки webhook.
+
+JSON декодируется внутри consumer: повреждённый JSON, неверная кодировка, массив вместо
+объекта и несовместимая версия события явно отклоняются в DLQ, а не зависают unacked
+при ошибке десериализации до входа в обработчик.
+
 ## Быстрый запуск
 
 Нужны Docker с Compose и свободные порты `8000` и `15672`.
+Для `make test-e2e` требуется Compose >= 2.24.4 (`!override` для изолированных портов),
+Python >= 3.12 и [uv](https://docs.astral.sh/uv/).
 
 ```bash
 cp .env.example .env
@@ -81,7 +120,17 @@ docker compose up --build -d
 docker compose ps
 ```
 
-Swagger UI: <http://localhost:8000/docs>. RabbitMQ Management:
+Swagger UI: <http://localhost:8000/docs>. Документация и OpenAPI тоже защищены:
+при работе через браузер нужно передавать `X-API-Key` и для загрузки страницы/схемы
+(например, правилом добавления заголовка только для `localhost:8000`). В самой UI
+кнопка **Authorize** задаёт ключ для запросов к API. Получить схему через терминал:
+
+```bash
+curl --fail-with-body -H 'X-API-Key: local-development-key' \
+  http://localhost:8000/openapi.json
+```
+
+RabbitMQ Management:
 <http://localhost:15672> (`payments` / `payments` только для локального окружения).
 
 Создать платёж:
@@ -149,8 +198,11 @@ webhook — это ожидаемая at-least-once семантика, поэт
 
 После трёх неудач исходное сообщение можно увидеть в `payments.dlq` через RabbitMQ
 Management. Replay из DLQ — осознанная операторская операция: сначала устраняется причина,
-затем сообщение переиздаётся в `payments.events` с routing key `payments.new`; стабильный
-event ID и состояние платежа делают повторную обработку безопасной.
+затем восстанавливается бюджет доставки и сообщение с прежним event ID переиздаётся в
+`payments.events` с routing key `payments.new`. Автоматического сброса бюджета нет:
+простой replay после исчерпания трёх webhook-попыток снова отправит событие в DLQ.
+Сброс должен быть отдельной контролируемой операцией с блокировкой строки платежа.
+Replay уже доставленного события — no-op, он не вызывает gateway или webhook повторно.
 
 ## Проверки
 
@@ -161,10 +213,20 @@ make test       # unit tests, branch coverage >= 85%
 make test-e2e   # real PostgreSQL + RabbitMQ + API + consumer + webhook sink
 ```
 
-E2E-тест использует отдельный Compose project, проверяет цепочку `503 → 503 → 200`, восемь
-конкурентных запросов с одним ключом, replay, конфликт идемпотентности и DLQ после трёх
-`503`. Его временные контейнеры и volumes всегда удаляются. CI выполняет unit и e2e в
-отдельных jobs.
+E2E-тест создаёт отдельный Compose project с автоматически выделенными портами и
+проверяет:
+
+- обязательный API key, атомарное создание одного платежа и одного outbox-события;
+- восемь конкурентных запросов с одним ключом, replay и конфликт `409`;
+- цепочку `503 → 503 → 200` с измерением экспоненциальных задержек и стабильным event ID;
+- повтор уже доставленного Rabbit-события без второго webhook;
+- восстановление после `SIGKILL` consumer во время webhook с активным DB lease;
+- приём платежа при остановленном RabbitMQ и доставку после его запуска;
+- DLQ после трёх `503` и DLQ для повреждённых сообщений.
+
+Временные контейнеры и volumes удаляются при выходе, включая ошибку/прерывание.
+CI выполняет unit и e2e в отдельных jobs. E2E настройки ускоряют эмулятор и retry;
+обычный Compose сохраняет задержки 2–5 секунд и вероятность успеха 90%.
 
 ## Конфигурация
 
@@ -188,8 +250,9 @@ E2E-тест использует отдельный Compose project, прове
 | `REQUIRE_HTTPS_WEBHOOKS` | `true` | запрет plaintext webhook |
 | `ALLOW_PRIVATE_WEBHOOKS` | `false` | разрешить private targets только локально |
 
-`GET /health/live` и `GET /health/ready` намеренно публичны для оркестратора; все бизнес-
-эндпоинты требуют `X-API-Key`. Readiness проверяет PostgreSQL, но не RabbitMQ: временно
+Все HTTP-эндпоинты, включая `GET /health/live`, `GET /health/ready`, `/docs` и
+`/openapi.json`, требуют `X-API-Key`. Docker healthcheck передаёт ключ из окружения
+контейнера. Readiness проверяет PostgreSQL, но не RabbitMQ: временно
 недоступный брокер не мешает безопасно принимать платежи в transactional outbox.
 
 ## Разработка и миграции
@@ -217,6 +280,12 @@ src/payment_service/
 
 ## Production notes
 
+- Один RabbitMQ в Compose нужен для воспроизводимого локального запуска. Для отказа
+  целого узла quorum queues требуют production-кластер из минимум трёх узлов;
+  локальные гарантии предполагают сохранность PostgreSQL/RabbitMQ volumes.
+- Тип существующей RabbitMQ-очереди нельзя менять декларацией. Если окружение запускалось
+  со старой classic topology, её нужно мигрировать отдельно; обновление поверх непустых
+  старых очередей не выполняет автоматическое удаление сообщений.
 - Production-конфигурация fail-fast отклоняет локальный API key, HTTP/private webhook;
   секреты должны поступать из secret manager, а не из `.env` или Compose defaults.
 - Для multi-tenant продукта нужны merchant-scoped credentials/ownership и HMAC-подпись
@@ -238,4 +307,5 @@ src/payment_service/
 - [RabbitMQ: Time-To-Live and Expiration](https://www.rabbitmq.com/docs/ttl)
 - [RabbitMQ: Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx)
 - [RabbitMQ: Publisher Confirms](https://www.rabbitmq.com/docs/confirms)
+- [RabbitMQ: Quorum Queues and reliable dead lettering](https://www.rabbitmq.com/docs/4.1/quorum-queues)
 - [FastStream: RabbitMQ publishing](https://faststream.ag2.ai/latest/rabbit/publishing/)
