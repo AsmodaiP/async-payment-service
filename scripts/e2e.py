@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import UUID, uuid4
 
@@ -91,9 +91,9 @@ def rabbit_queue(name: str) -> dict[str, Any]:
     return cast(dict[str, Any], payload)
 
 
-def compose(*arguments: str) -> None:
+def compose(*arguments: str) -> str:
     # This is always the disposable project created by run-e2e.sh.
-    subprocess.run(
+    result = subprocess.run(
         [
             "docker",
             "compose",
@@ -107,7 +107,27 @@ def compose(*arguments: str) -> None:
         ],
         check=True,
         timeout=60,
+        text=True,
+        stdout=subprocess.PIPE,
     )
+    return result.stdout
+
+
+def refresh_rabbit_management() -> None:
+    global RABBIT
+    # Docker can allocate a different ephemeral host port when a container starts
+    # again. AMQP recovery does not imply that the Management HTTP listener is ready.
+    RABBIT = f"http://{compose('port', 'rabbitmq', '15672').strip()}"
+    deadline = time.monotonic() + 30
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            rabbit_queue("payments.new")
+            return
+        except (URLError, TimeoutError, ConnectionError) as exc:
+            last_error = exc
+            time.sleep(0.25)
+    raise TimeoutError("RabbitMQ Management did not recover after restart") from last_error
 
 
 def wait_for_sink(payment_id: str, timeout: float = 15) -> list[dict[str, Any]]:
@@ -348,6 +368,7 @@ def main() -> None:
     finally:
         compose("start", "rabbitmq")
     wait_for_payment(offline_id, lambda item: item["webhook_delivered_at"] is not None, timeout=60)
+    refresh_rabbit_management()
 
     # Check identities in the DLQ, not just its approximate management counter.
     poison_ids = {str(uuid4()) for _ in range(4)}
