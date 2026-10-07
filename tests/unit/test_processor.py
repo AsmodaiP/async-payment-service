@@ -50,6 +50,8 @@ def snapshot(
         amount=Decimal("10.25"),
         currency=Currency.RUB,
         status=status,
+        description=None,
+        metadata={},
         webhook_url="https://merchant.example/hook",
         processed_at=processed_at,
         webhook_delivered_at=delivered_at,

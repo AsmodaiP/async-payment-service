@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections import defaultdict
 from typing import Any
 
-from fastapi import FastAPI, Request, Response, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
+
+from payment_service.consumer.webhook import (
+    SIGNATURE_HEADER,
+    TIMESTAMP_HEADER,
+    verify_webhook_signature,
+)
 
 app = FastAPI(title="E2E webhook sink")
+# When set, the sink behaves like a real merchant: unsigned or forged webhooks are refused.
+_signing_secret = os.environ.get("WEBHOOK_SIGNING_SECRET")
 _lock = asyncio.Lock()
 _events: list[dict[str, Any]] = []
 _attempts: defaultdict[str, int] = defaultdict(int)
@@ -63,11 +72,21 @@ async def block_first(request: Request) -> dict[str, bool]:
 
 
 async def _record(request: Request) -> dict[str, Any]:
+    raw_body = await request.body()
+    if _signing_secret is not None and not verify_webhook_signature(
+        _signing_secret,
+        raw_body,
+        timestamp=request.headers.get(TIMESTAMP_HEADER),
+        signature=request.headers.get(SIGNATURE_HEADER),
+    ):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid webhook signature")
     event = {
         "received_at": time.monotonic(),
         "body": await request.json(),
         "attempt": request.headers.get("X-Webhook-Attempt"),
         "event_id": request.headers.get("X-Webhook-Event-Id"),
+        "timestamp": request.headers.get(TIMESTAMP_HEADER),
+        "signature": request.headers.get(SIGNATURE_HEADER),
     }
     async with _lock:
         _events.append(event)

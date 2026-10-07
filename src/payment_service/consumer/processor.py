@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Protocol
 from uuid import UUID, uuid4
 
+from pydantic import JsonValue
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -64,6 +65,8 @@ class PaymentSnapshot:
     amount: Decimal
     currency: Currency
     status: PaymentStatus
+    description: str | None
+    metadata: dict[str, JsonValue]
     webhook_url: str
     processed_at: datetime | None
     webhook_delivered_at: datetime | None
@@ -112,6 +115,8 @@ class PaymentProcessor:
             amount=claimed.amount,
             currency=claimed.currency,
             status=claimed.status,
+            description=claimed.description,
+            metadata=claimed.metadata,
             webhook_url=claimed.webhook_url,
             processed_at=claimed.processed_at,
         )
@@ -288,6 +293,8 @@ class PaymentProcessor:
             amount=payment.amount,
             currency=Currency(payment.currency),
             status=PaymentStatus(payment.status),
+            description=payment.description,
+            metadata=dict(payment.payment_metadata),
             webhook_url=payment.webhook_url,
             processed_at=payment.processed_at,
             webhook_delivered_at=payment.webhook_delivered_at,

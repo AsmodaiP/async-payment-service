@@ -25,6 +25,7 @@ services:
       WEBHOOK_TIMEOUT_SECONDS: "3"
       WEBHOOK_LEASE_SECONDS: "7"
       REQUIRE_HTTPS_WEBHOOKS: "false"
+      WEBHOOK_SIGNING_SECRET: "e2e-webhook-signing-secret-0123456789"
     depends_on:
       webhook-sink:
         condition: service_healthy
@@ -41,6 +42,8 @@ services:
       - 0.0.0.0
       - --port
       - "8080"
+    environment:
+      WEBHOOK_SIGNING_SECRET: "e2e-webhook-signing-secret-0123456789"
     init: true
     healthcheck:
       test:

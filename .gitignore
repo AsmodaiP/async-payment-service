@@ -11,3 +11,4 @@ htmlcov/
 dist/
 *.egg-info/
 graphify-out/
+.DS_Store

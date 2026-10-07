@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     webhook_busy_retry_delay_seconds: float = Field(default=1.0, gt=0, le=30)
     require_https_webhooks: bool = True
     allow_private_webhooks: bool = False
+    webhook_signing_secret: SecretStr | None = None
 
     @model_validator(mode="after")
     def validate_delay_range(self) -> Settings:
@@ -74,6 +75,11 @@ class Settings(BaseSettings):
                 raise ValueError("default database credentials are forbidden in production")
             if "payments:payments@" in self.rabbitmq_url.get_secret_value():
                 raise ValueError("default RabbitMQ credentials are forbidden in production")
+            secret = self.webhook_signing_secret
+            if secret is None or len(secret.get_secret_value()) < 32:
+                raise ValueError(
+                    "WEBHOOK_SIGNING_SECRET of at least 32 characters is required in production"
+                )
         return self
 
 

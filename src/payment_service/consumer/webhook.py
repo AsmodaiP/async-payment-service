@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import ipaddress
+import json
 import socket
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -11,6 +16,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
+from pydantic import JsonValue
 
 from payment_service.config import Settings
 from payment_service.domain import Currency, PaymentStatus
@@ -24,14 +30,68 @@ class WebhookDeliveryError(RuntimeError):
     """The target did not accept the notification."""
 
 
+SIGNATURE_HEADER = "X-Webhook-Signature"
+TIMESTAMP_HEADER = "X-Webhook-Timestamp"
+EVENT_ID_HEADER = "X-Webhook-Event-Id"
+ATTEMPT_HEADER = "X-Webhook-Attempt"
+
+
 @dataclass(frozen=True, slots=True)
 class WebhookPayment:
     id: UUID
     amount: Decimal
     currency: Currency
     status: PaymentStatus
+    description: str | None
+    metadata: dict[str, JsonValue]
     webhook_url: str
     processed_at: datetime
+
+
+def encode_webhook_body(payload: dict[str, Any]) -> bytes:
+    """Canonical UTF-8 JSON so the receiver can verify the signature over the raw body."""
+
+    return json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def sign_webhook(secret: str, timestamp: int, body: bytes) -> str:
+    """Return ``sha256=<hex>`` over ``"{timestamp}." + body`` (Stripe-style scheme)."""
+
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        f"{timestamp}.".encode() + body,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"sha256={digest}"
+
+
+def verify_webhook_signature(
+    secret: str,
+    body: bytes,
+    *,
+    timestamp: str | None,
+    signature: str | None,
+    tolerance_seconds: int = 300,
+    now: float | None = None,
+) -> bool:
+    """Constant-time check that receivers can copy; rejects replays outside the tolerance."""
+
+    if timestamp is None or signature is None:
+        return False
+    try:
+        sent_at = int(timestamp)
+    except ValueError:
+        return False
+    current = time.time() if now is None else now
+    if abs(current - sent_at) > tolerance_seconds:
+        return False
+    return hmac.compare_digest(sign_webhook(secret, sent_at, body), signature)
 
 
 async def validate_webhook_target(
@@ -73,8 +133,16 @@ async def validate_webhook_target(
 
 
 class WebhookClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self._settings = settings
+        self._clock = clock
+        secret = settings.webhook_signing_secret
+        self._signing_secret = secret.get_secret_value() if secret is not None else None
         timeout = httpx.Timeout(settings.webhook_timeout_seconds)
         self._client = httpx.AsyncClient(
             timeout=timeout,
@@ -99,12 +167,20 @@ class WebhookClient:
             "status": payment.status.value,
             "amount": str(payment.amount),
             "currency": payment.currency.value,
+            "description": payment.description,
+            "metadata": payment.metadata,
             "processed_at": payment.processed_at.isoformat(),
         }
+        body = encode_webhook_body(payload)
         headers = {
-            "X-Webhook-Event-Id": str(event_id),
-            "X-Webhook-Attempt": str(attempt),
+            "Content-Type": "application/json",
+            EVENT_ID_HEADER: str(event_id),
+            ATTEMPT_HEADER: str(attempt),
         }
+        if self._signing_secret is not None:
+            timestamp = int(self._clock())
+            headers[TIMESTAMP_HEADER] = str(timestamp)
+            headers[SIGNATURE_HEADER] = sign_webhook(self._signing_secret, timestamp, body)
         try:
             async with asyncio.timeout(self._settings.webhook_timeout_seconds):
                 await validate_webhook_target(
@@ -115,7 +191,7 @@ class WebhookClient:
                 async with self._client.stream(
                     "POST",
                     payment.webhook_url,
-                    json=payload,
+                    content=body,
                     headers=headers,
                 ) as response:
                     if response.status_code < 200 or response.status_code >= 300:

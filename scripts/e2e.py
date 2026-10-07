@@ -395,6 +395,10 @@ def main() -> None:
         event for event in sink["events"] if event["body"]["payment_id"] == payment_id
     ]
     assert [event["attempt"] for event in successful_attempts] == ["1", "2", "3"]
+    # The sink refuses unsigned or forged webhooks, so every recorded event was verified.
+    assert all(event["signature"] and event["timestamp"] for event in successful_attempts)
+    assert successful_attempts[0]["body"]["metadata"] == {"scenario": "/hooks/fail-twice"}
+    assert successful_attempts[0]["body"]["description"] == "Docker e2e payment"
     assert len({event["event_id"] for event in successful_attempts}) == 1
     assert successful_attempts[1]["received_at"] - successful_attempts[0]["received_at"] >= 0.95
     assert successful_attempts[2]["received_at"] - successful_attempts[1]["received_at"] >= 1.95

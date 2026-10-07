@@ -16,7 +16,8 @@
   каждой публикации брокером.
 - Один асинхронный FastStream consumer, детерминированная эмуляция обработки 2–5 секунд
   с вероятностью успеха 90%.
-- Webhook с тремя попытками в durable retry-очередях и экспоненциальными задержками;
+- Webhook с HMAC-SHA256 подписью, тремя попытками в durable retry-очередях и
+  экспоненциальными задержками;
   исчерпанные и некорректные события попадают в DLQ.
 - Защита webhook от очевидного SSRF, структурированные JSON-логи, Alembic, Docker Compose,
   unit- и сквозные Docker-тесты, CI.
@@ -177,9 +178,47 @@ docker compose down
 
 ## Webhook
 
-Успешным считается только HTTP `2xx`; redirects не выполняются. В payload передаются
-`event_id`, `event_type`, `payment_id`, `status`, `amount`, `currency`, `processed_at`, а в
-заголовках — стабильный `X-Webhook-Event-Id` и номер `X-Webhook-Attempt`.
+Успешным считается только HTTP `2xx`; redirects не выполняются. Тело — канонический JSON
+(сортированные ключи, без пробелов, UTF-8):
+
+```json
+{
+  "amount": "1499.90",
+  "currency": "RUB",
+  "description": "Order #A-1042",
+  "event_id": "5d2d9d0e-7a7c-4a52-9d3e-0b1f5f6e1a11",
+  "event_type": "payment.succeeded",
+  "metadata": {"customer_id": 321, "order_id": "A-1042"},
+  "payment_id": "98ce20cc-e407-4881-87ea-c247218668d8",
+  "processed_at": "2026-08-01T12:00:03.214Z",
+  "status": "succeeded"
+}
+```
+
+| Заголовок | Значение |
+|---|---|
+| `X-Webhook-Event-Id` | стабильный ID события; одинаков во всех попытках, ключ дедупликации |
+| `X-Webhook-Attempt` | номер попытки `1..3` |
+| `X-Webhook-Timestamp` | Unix time отправки, защита от replay |
+| `X-Webhook-Signature` | `sha256=<hex HMAC-SHA256(secret, "{timestamp}." + body)>` |
+
+Подпись включается при заданном `WEBHOOK_SIGNING_SECRET` (в production обязателен).
+Получатель проверяет подпись над сырыми байтами тела и отклоняет запросы, у которых
+`timestamp` отличается от текущего времени больше чем на допуск (по умолчанию 5 минут):
+
+```python
+import hmac, hashlib, time
+
+
+def verify(secret: str, body: bytes, timestamp: str, signature: str) -> bool:
+    if abs(time.time() - int(timestamp)) > 300:
+        return False
+    expected = hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256)
+    return hmac.compare_digest(f"sha256={expected.hexdigest()}", signature)
+```
+
+Та же функция доступна как `payment_service.consumer.webhook.verify_webhook_signature`;
+e2e webhook-sink использует её и отвергает неподписанные запросы.
 
 По умолчанию разрешён только HTTPS и запрещены localhost, private/link-local/reserved IP,
 URL с credentials и имена, которые резолвятся в непубличный адрес.
@@ -249,6 +288,7 @@ CI выполняет unit и e2e в отдельных jobs. E2E настрой
 | `WEBHOOK_BUSY_RETRY_DELAY_SECONDS` | `1` | пауза перед requeue занятого claim |
 | `REQUIRE_HTTPS_WEBHOOKS` | `true` | запрет plaintext webhook |
 | `ALLOW_PRIVATE_WEBHOOKS` | `false` | разрешить private targets только локально |
+| `WEBHOOK_SIGNING_SECRET` | local placeholder | секрет HMAC-подписи webhook; в production >= 32 символов |
 
 Все HTTP-эндпоинты, включая `GET /health/live`, `GET /health/ready`, `/docs` и
 `/openapi.json`, требуют `X-API-Key`. Docker healthcheck передаёт ключ из окружения
@@ -286,10 +326,12 @@ src/payment_service/
 - Тип существующей RabbitMQ-очереди нельзя менять декларацией. Если окружение запускалось
   со старой classic topology, её нужно мигрировать отдельно; обновление поверх непустых
   старых очередей не выполняет автоматическое удаление сообщений.
-- Production-конфигурация fail-fast отклоняет локальный API key, HTTP/private webhook;
-  секреты должны поступать из secret manager, а не из `.env` или Compose defaults.
-- Для multi-tenant продукта нужны merchant-scoped credentials/ownership и HMAC-подпись
-  webhook; единый API key достаточен только для scope тестового задания.
+- Production-конфигурация fail-fast отклоняет локальный API key, HTTP/private webhook и
+  отсутствующий секрет подписи; секреты должны поступать из secret manager, а не из
+  `.env` или Compose defaults.
+- Для multi-tenant продукта нужны merchant-scoped credentials/ownership и секрет подписи
+  на каждого получателя; единый API key и общий секрет достаточны только для scope
+  тестового задания.
 - TLS, rate/body limits и сетевой egress обычно обеспечиваются ingress/service mesh.
 - Для большой нагрузки relay можно вынести в отдельный deployment без изменения модели
   данных; lease/`SKIP LOCKED` уже поддерживает горизонтальное масштабирование.
