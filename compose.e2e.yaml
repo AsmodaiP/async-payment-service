@@ -4,6 +4,7 @@ services:
       - "127.0.0.1::8000"
     environment:
       ENVIRONMENT: "test"
+      PUBLIC_DOCS: "false"
       ALLOW_PRIVATE_WEBHOOKS: "true"
       OUTBOX_POLL_INTERVAL_SECONDS: "0.05"
       PAYMENT_MIN_DELAY_SECONDS: "0.05"

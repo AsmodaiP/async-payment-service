@@ -22,6 +22,21 @@
 - Защита webhook от очевидного SSRF, структурированные JSON-логи, Alembic, Docker Compose,
   unit- и сквозные Docker-тесты, CI.
 
+## Соответствие заданию
+
+| Требование | Где реализовано | Как проверяется |
+|---|---|---|
+| Модели и миграции `payments`, `outbox` | [`db/models.py`](src/payment_service/db/models.py), [`migrations/versions/0001_initial.py`](migrations/versions/0001_initial.py) | `docker compose run --rm migrate`, CHECK/UNIQUE constraints |
+| `POST /api/v1/payments` → `202`, `GET /api/v1/payments/{id}` | [`api/routes.py`](src/payment_service/api/routes.py), [`api/schemas.py`](src/payment_service/api/schemas.py) | `tests/unit/test_api.py`, e2e |
+| `Idempotency-Key` обязателен, защита от дублей | [`application/payments.py`](src/payment_service/application/payments.py) — `INSERT ... ON CONFLICT` + fingerprint тела | e2e: 8 конкурентных запросов → один платёж, другой body → `409` |
+| `X-API-Key` для всех эндпоинтов | [`api/dependencies.py`](src/payment_service/api/dependencies.py), constant-time сравнение | `test_api.py`, e2e `401` |
+| Outbox pattern, событие в `payments.new` | [`messaging/outbox.py`](src/payment_service/messaging/outbox.py) — lease + `SKIP LOCKED` + publisher confirms | e2e: платёж принят при остановленном RabbitMQ и доставлен после старта |
+| Один consumer: gateway 2–5 с / 90 %, статус в БД, webhook | [`consumer/app.py`](src/payment_service/consumer/app.py), [`consumer/processor.py`](src/payment_service/consumer/processor.py), [`consumer/gateway.py`](src/payment_service/consumer/gateway.py) | `test_processor.py`, `test_gateway.py`, e2e |
+| Retry: 3 попытки с экспоненциальной задержкой | [`messaging/topology.py`](src/payment_service/messaging/topology.py) — TTL-очереди `payments.retry.{2,3}` | e2e: интервалы между попытками ≥ 1 с и ≥ 2 с |
+| DLQ после 3 попыток | `payments.dlx` → `payments.dlq`, `x-dead-letter-strategy=at-least-once` | e2e: `always-fail` и повреждённые сообщения оказываются в `payments.dlq` |
+| Docker: postgres, rabbitmq, api, consumer | [`compose.yaml`](compose.yaml), [`Dockerfile`](Dockerfile) (multi-stage, non-root) | `docker compose up --build`, CI `e2e` job |
+| README с запуском и примерами | этот файл | — |
+
 ## Архитектура
 
 ```mermaid
@@ -121,10 +136,10 @@ docker compose up --build -d
 docker compose ps
 ```
 
-Swagger UI: <http://localhost:8000/docs>. Документация и OpenAPI тоже защищены:
-при работе через браузер нужно передавать `X-API-Key` и для загрузки страницы/схемы
-(например, правилом добавления заголовка только для `localhost:8000`). В самой UI
-кнопка **Authorize** задаёт ключ для запросов к API. Получить схему через терминал:
+Swagger UI: <http://localhost:8000/docs>. Страница и `/openapi.json` локально открыты
+(`PUBLIC_DOCS=true`), потому что браузер не может передать `X-API-Key` при загрузке самой
+страницы. Все бизнес- и health-эндпоинты требуют ключ: в UI нажмите **Authorize** и введите
+`local-development-key`. `PUBLIC_DOCS=false` закрывает ключом и документацию:
 
 ```bash
 curl --fail-with-body -H 'X-API-Key: local-development-key' \
@@ -275,6 +290,7 @@ CI выполняет unit и e2e в отдельных jobs. E2E настрой
 |---|---:|---|
 | `ENVIRONMENT` | `development` | `production` включает fail-fast security checks |
 | `API_KEY` | `local-development-key` | локальный ключ; обязательно заменить вне local |
+| `PUBLIC_DOCS` | `true` | `/docs` и `/openapi.json` без ключа; `false` — защищены как всё остальное |
 | `DATABASE_URL` | — | asyncpg DSN PostgreSQL |
 | `RABBITMQ_URL` | — | AMQP DSN; хранится как secret setting |
 | `RABBIT_PUBLISH_TIMEOUT_SECONDS` | `10` | deadline ожидания publisher confirm |
@@ -290,9 +306,9 @@ CI выполняет unit и e2e в отдельных jobs. E2E настрой
 | `ALLOW_PRIVATE_WEBHOOKS` | `false` | разрешить private targets только локально |
 | `WEBHOOK_SIGNING_SECRET` | local placeholder | секрет HMAC-подписи webhook; в production >= 32 символов |
 
-Все HTTP-эндпоинты, включая `GET /health/live`, `GET /health/ready`, `/docs` и
-`/openapi.json`, требуют `X-API-Key`. Docker healthcheck передаёт ключ из окружения
-контейнера. Readiness проверяет PostgreSQL, но не RabbitMQ: временно
+Все эндпоинты API, включая `GET /health/live` и `GET /health/ready`, требуют `X-API-Key`;
+`/docs` и `/openapi.json` — тоже, если `PUBLIC_DOCS=false` (так работает e2e). Docker
+healthcheck передаёт ключ из окружения контейнера. Readiness проверяет PostgreSQL, но не RabbitMQ: временно
 недоступный брокер не мешает безопасно принимать платежи в transactional outbox.
 
 ## Разработка и миграции

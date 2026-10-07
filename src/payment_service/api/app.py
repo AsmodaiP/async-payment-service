@@ -89,11 +89,11 @@ def create_app(
             await db_engine.dispose()
             logger.info("service_stopped", service=app_settings.service_name)
 
+    protected = [Depends(require_api_key)]
     app = FastAPI(
         title=app_settings.service_name,
         version="1.0.0",
         lifespan=lifespan,
-        dependencies=[Depends(require_api_key)],
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -135,6 +135,7 @@ def create_app(
         response_model=HealthResponse,
         tags=["health"],
         summary="Process liveness",
+        dependencies=protected,
     )
     async def health_live() -> HealthResponse:
         return HealthResponse(status="ok")
@@ -144,6 +145,7 @@ def create_app(
         response_model=HealthResponse,
         tags=["health"],
         summary="Database readiness",
+        dependencies=protected,
         responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Database unavailable"}},
     )
     async def health_ready() -> HealthResponse | JSONResponse:
@@ -156,13 +158,16 @@ def create_app(
 
     app.include_router(payments_router)
 
-    # FastAPI's built-in docs routes bypass global dependencies. Register them
-    # explicitly so the assignment's API-key requirement also covers the schema.
-    @app.get("/openapi.json", include_in_schema=False)
+    # Business and health endpoints always require the key. Swagger UI loads its own
+    # page and schema without custom headers, so docs are public unless PUBLIC_DOCS=false;
+    # the Authorize button then supplies X-API-Key for the actual API calls.
+    docs_dependencies = [] if app_settings.public_docs else protected
+
+    @app.get("/openapi.json", include_in_schema=False, dependencies=docs_dependencies)
     async def openapi_schema() -> dict[str, Any]:
         return app.openapi()
 
-    @app.get("/docs", include_in_schema=False)
+    @app.get("/docs", include_in_schema=False, dependencies=docs_dependencies)
     async def swagger_docs() -> HTMLResponse:
         return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{app.title} — API")
 

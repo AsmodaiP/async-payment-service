@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     api_key: SecretStr = SecretStr("local-development-key")
+    # Swagger UI cannot send X-API-Key while loading itself; keep docs reachable locally.
+    public_docs: bool = True
     database_url: str = "postgresql+asyncpg://payments:payments@localhost:5432/payments"
     rabbitmq_url: SecretStr = SecretStr("amqp://payments:payments@localhost:5672/")
 

@@ -3,6 +3,7 @@ name: async-payment-service
 x-app-environment: &app-environment
   ENVIRONMENT: ${ENVIRONMENT:-development}
   API_KEY: ${API_KEY:-local-development-key}
+  PUBLIC_DOCS: ${PUBLIC_DOCS:-true}
   DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
   RABBITMQ_URL: amqp://payments:payments@rabbitmq:5672/
   LOG_LEVEL: ${LOG_LEVEL:-INFO}

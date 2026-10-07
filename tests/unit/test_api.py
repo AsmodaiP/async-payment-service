@@ -190,11 +190,30 @@ async def test_get_payment_maps_not_found(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/health/live", "/health/ready", "/docs", "/openapi.json"])
-async def test_all_http_endpoints_require_api_key(http_client: AsyncClient, path: str) -> None:
+@pytest.mark.parametrize("path", ["/health/live", "/health/ready"])
+async def test_health_endpoints_require_api_key(http_client: AsyncClient, path: str) -> None:
     assert (await http_client.get(path)).status_code == 401
     assert (await http_client.get(path, headers={"X-API-Key": "wrong-key"})).status_code == 401
     assert (await http_client.get(path, headers={"X-API-Key": API_KEY})).status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/docs", "/openapi.json"])
+async def test_docs_are_public_by_default_and_protectable(path: str) -> None:
+    async def ready() -> bool:
+        return True
+
+    public = create_app(Settings(api_key=API_KEY), ready, start_outbox_relay=False)
+    async with AsyncClient(transport=ASGITransport(app=public), base_url="http://test") as http:
+        assert (await http.get(path)).status_code == 200
+
+    locked = create_app(
+        Settings(api_key=API_KEY, public_docs=False), ready, start_outbox_relay=False
+    )
+    async with AsyncClient(transport=ASGITransport(app=locked), base_url="http://test") as http:
+        assert (await http.get(path)).status_code == 401
+        assert (await http.get(path, headers={"X-API-Key": "wrong-key"})).status_code == 401
+        assert (await http.get(path, headers={"X-API-Key": API_KEY})).status_code == 200
 
 
 @pytest.mark.asyncio
